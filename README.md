@@ -1,84 +1,106 @@
-# LLM Debate Room
+# LLM Debate Room — proto-1.1234569-ready
 
-Gemini, Groq, Mistral, Cloudflare Workers AI가 서로 다른 역할로 독립 분석하고 반박한 뒤 최종 판결문을 만드는 로컬 Streamlit 앱입니다.
+여러 LLM이 같은 질문을 독립 분석한 뒤, 증거 검증 → 반박 → 자기모순 감사 → 최종 판결까지 수행하는 로컬 Streamlit 앱입니다.
 
-## 기본 역할
+## 제일 먼저 볼 것
 
-- Analyst: Gemini
-- Contrarian: Groq
-- Alternative: Mistral
-- Verifier: Cloudflare Workers AI
-- Judge: Cloudflare Workers AI
+- `MODEL_MAP.md` — 어떤 모델이 어떤 역할인지 한눈에 보기
+- `START_APP.cmd` — 평소 실행
+- `RUN_FIRST.cmd` — 처음 한 번 패키지 설치 + 실행
+- `prompts.py` — 추론 헌법과 역할별 규칙
+- `app.py` — 화면과 전체 토론 흐름
+- `providers.py` — Gemini/Groq/Cerebras/NVIDIA/OpenRouter/Cohere 호출 및 fallback
+- `memory_store.py` — SQLite 토론 기록과 후속 질문 저장
 
-역할별 제공자는 화면에서 자유롭게 바꿀 수 있습니다. 429, 413, 빈 응답, 일시 장애가 발생하면 다른 제공자로 자동 대체합니다.
+## 현재 기본 역할
 
-## 주요 기능
+| 역할 | 기본 엔진 |
+|---|---|
+| Analyst | Gemini |
+| Contrarian | Groq GPT-OSS |
+| Alternative | Cerebras GPT-OSS |
+| Red Team | OpenRouter |
+| Evidence Verifier | Cohere |
+| Consistency Auditor | NVIDIA Nemotron Super |
+| Judge | NVIDIA Nemotron Ultra |
 
-- Gemini + Groq + Mistral + Cloudflare Workers AI 4개 독립 할당량 사용
-- Groq Compound Mini 공용 웹조사 1회
-- FACT / INFERENCE / HYPOTHESIS / UNKNOWN 구분
-- 0~3회 반박 라운드
-- 긴 토론 컨텍스트 압축
-- 출력 길이 제한 감지 및 자동 이어쓰기
-- 빈 최종 답변 감지 후 재시도
-- 실제 사용 모델, 종료 사유, 사용량, fallback 기록 표시
-- SQLite Debate Memory
-- 토론 종료 후 Judge 또는 특정 Agent에게 추가 질문·사실 정정·판결 재검토
-- 후속 질문도 SQLite에 저장
-- API Key를 저장소에 올리지 않는 구조
+자세한 모델 ID와 흐름은 `MODEL_MAP.md`를 보세요.
 
-## 설치 및 실행
+## 실행
 
-Windows에서 저장소를 내려받은 뒤 처음 한 번 `RUN_FIRST.cmd`를 실행합니다.
-
-이후에는 `START_APP.cmd`만 실행하면 됩니다.
-
-직접 실행:
-
-```powershell
-python -m pip install -r requirements.txt
-python -m streamlit run app.py
-```
-
-## Cloudflare Workers AI 준비
-
-Cloudflare Dashboard에서 Workers AI 페이지로 이동한 뒤 `Use REST API`를 선택합니다.
-
-1. `Create a Workers AI API Token`으로 토큰을 발급합니다.
-2. 같은 화면의 `Account ID`를 복사합니다.
-3. 앱 사이드바에 두 값을 입력합니다.
-
-기본 Cloudflare 모델은 다음입니다.
+처음 한 번:
 
 ```text
-@cf/nvidia/nemotron-3-120b-a12b
+RUN_FIRST.cmd
 ```
 
-Cloudflare 무료 플랜에는 일일 무료 Neuron 할당량이 있지만 무제한은 아닙니다. 할당량을 넘으면 현재 토론에서 다른 제공자로 자동 대체됩니다.
+그 다음부터:
 
-## 환경변수
-
-앱 입력칸 대신 환경변수를 사용할 수 있습니다.
-
-```powershell
-$env:GEMINI_API_KEY="..."
-$env:GROQ_API_KEY="..."
-$env:MISTRAL_API_KEY="..."
-$env:CLOUDFLARE_API_TOKEN="..."
-$env:CLOUDFLARE_ACCOUNT_ID="..."
+```text
+START_APP.cmd
 ```
 
-`.env`와 실제 API Key는 공개 GitHub 저장소에 커밋하지 마세요.
+`START_APP.cmd`는 자신과 같은 폴더의 `app.py`를 실행하도록 되어 있습니다.
 
-## 토큰·할당량 설계
+## API 키
 
-- 공용 웹조사는 한 번만 실행하고 모든 Agent가 공유합니다.
-- 반박 라운드는 역할별 발언을 압축해서 전달합니다.
-- 입력이 너무 크면 자동 축약 후 재시도합니다.
-- 출력이 길이 제한으로 끝나면 같은 모델에 이어쓰기를 요청합니다.
-- 한 제공자가 죽으면 Cloudflare → Mistral → Groq → Gemini 순서로 fallback합니다.
-- 사이드바에서 제공자별 이번 토론 호출 예산을 설정할 수 있습니다. 0은 앱 내부 제한 없음입니다.
+앱 왼쪽 사이드바에 직접 넣거나, `.env.example`을 복사해 `.env`를 만들고 다음 키를 넣을 수 있습니다.
+
+```dotenv
+GEMINI_API_KEY=
+GROQ_API_KEY=
+CEREBRAS_API_KEY=
+NVIDIA_API_KEY=
+OPENROUTER_API_KEY=
+COHERE_API_KEY=
+```
+
+`.env`는 GitHub에 올리지 마세요.
+
+## 핵심 설계
+
+```text
+질문
+ ↓
+독립 분석 4개
+ ↓
+공용 웹조사 + Evidence Verifier
+ ↓
+상호 반박
+ ↓
+Consistency Auditor
+ ↓
+Judge
+ ↓
+SQLite 저장
+ ↓
+Judge 또는 특정 Agent에게 후속 질문
+```
+
+추론 규칙은 다음 문제를 막는 데 초점을 둡니다.
+
+- `자료가 없다 = 반대가 참` 식 오류
+- 정확한 제품명을 줬는데 제품군 일반론으로 회피
+- 사용자가 고정한 조건을 중간에 변경
+- 필수 구성품을 제거한 뒤 다시 필요하다고 주장하는 자기모순
+- 현실 잡음이 있다는 이유만으로 상대적 성능 차이를 무효화
+- Judge가 문제 정의와 사용자 질문을 장황하게 반복
+
+## 현재 공급자
+
+- Google Gemini
+- Groq
+- Cerebras
+- NVIDIA NIM
+- OpenRouter
+- Cohere
+
+Mistral과 Cloudflare Workers AI는 이 브랜치에서 제거했습니다.
+
+## 데이터
+
+토론과 후속 질문은 기본적으로 `data/memory.sqlite3`에 저장됩니다. 이 DB 파일은 `.gitignore` 대상입니다.
 
 ## 주의
 
-이 프로그램은 연구·토론 도구입니다. LLM 출력과 웹조사 결과는 별도로 사실 검증해야 합니다. 투자·의료·법률 등 고위험 의사결정을 자동 실행하는 용도로 사용하지 마세요.
+이 프로젝트는 연구·토론용입니다. 여러 모델이 동의한다고 사실이 되는 것은 아니며, 특히 투자·의료·법률·안전 관련 결론은 사람이 별도로 검증해야 합니다.
