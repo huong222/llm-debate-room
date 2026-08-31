@@ -8,15 +8,21 @@ from typing import Any, Dict, List, Optional, Tuple
 
 
 class MemoryStore:
-    def __init__(self, path: Path):
+    def __init__(self, path: Path) -> None:
         self.path = path
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self._init()
+        self._init_schema()
 
     def _connect(self) -> sqlite3.Connection:
-        return sqlite3.connect(self.path)
+        con = sqlite3.connect(self.path)
+        con.row_factory = sqlite3.Row
+        return con
 
-    def _init(self) -> None:
+    @staticmethod
+    def _columns(con: sqlite3.Connection, table: str) -> set[str]:
+        return {row[1] for row in con.execute(f"PRAGMA table_info({table})").fetchall()}
+
+    def _init_schema(self) -> None:
         con = self._connect()
         con.execute(
             """
@@ -30,6 +36,18 @@ class MemoryStore:
             )
             """
         )
+        existing = self._columns(con, "debates")
+        additions = {
+            "version": "TEXT",
+            "target": "TEXT",
+            "constraints_text": "TEXT",
+            "goal": "TEXT",
+            "research": "TEXT",
+        }
+        for name, sql_type in additions.items():
+            if name not in existing:
+                con.execute(f"ALTER TABLE debates ADD COLUMN {name} {sql_type}")
+
         con.execute(
             """
             CREATE TABLE IF NOT EXISTS followups (
@@ -37,11 +55,11 @@ class MemoryStore:
                 debate_id INTEGER NOT NULL,
                 created_at TEXT NOT NULL,
                 target_role TEXT NOT NULL,
-                provider TEXT,
-                question_type TEXT,
+                question_type TEXT NOT NULL,
                 question TEXT NOT NULL,
                 answer TEXT NOT NULL,
-                metadata_json TEXT,
+                engine TEXT,
+                model TEXT,
                 FOREIGN KEY(debate_id) REFERENCES debates(id)
             )
             """
@@ -49,113 +67,135 @@ class MemoryStore:
         con.commit()
         con.close()
 
-    def save(self, topic: str, context: str, verdict: str, transcript: Dict[str, Any]) -> int:
+    def save_debate(
+        self,
+        *,
+        version: str,
+        topic: str,
+        target: str,
+        constraints_text: str,
+        goal: str,
+        context: str,
+        research: str,
+        verdict: str,
+        transcript: Dict[str, Any],
+    ) -> int:
         con = self._connect()
         cur = con.execute(
-            "INSERT INTO debates(created_at, topic, context, verdict, transcript_json) VALUES (?, ?, ?, ?, ?)",
+            """
+            INSERT INTO debates(
+                created_at, version, topic, target, constraints_text,
+                goal, context, research, verdict, transcript_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
             (
                 datetime.now(timezone.utc).isoformat(),
+                version,
                 topic,
+                target,
+                constraints_text,
+                goal,
                 context,
+                research,
                 verdict,
                 json.dumps(transcript, ensure_ascii=False),
             ),
         )
         con.commit()
-        row_id = int(cur.lastrowid)
+        debate_id = int(cur.lastrowid)
         con.close()
-        return row_id
+        return debate_id
 
-    def recall(self, query: str, limit: int = 4) -> List[Tuple]:
-        words = [word for word in query.replace("\n", " ").split() if len(word) >= 2][:8]
-        if not words:
-            return []
-        clauses = " OR ".join(["topic LIKE ? OR context LIKE ?" for _ in words])
-        params: List[Any] = []
-        for word in words:
-            params += [f"%{word}%", f"%{word}%"]
-        params.append(limit)
-        con = self._connect()
-        rows = con.execute(
-            f"SELECT id, created_at, topic, verdict FROM debates WHERE {clauses} ORDER BY id DESC LIMIT ?",
-            params,
-        ).fetchall()
-        con.close()
-        return rows
-
-    def get(self, debate_id: int) -> Optional[Dict[str, Any]]:
-        con = self._connect()
-        row = con.execute(
-            "SELECT id, created_at, topic, context, verdict, transcript_json FROM debates WHERE id = ?",
-            (debate_id,),
-        ).fetchone()
-        con.close()
-        if not row:
-            return None
-        return {
-            "id": row[0],
-            "created_at": row[1],
-            "topic": row[2],
-            "context": row[3] or "",
-            "verdict": row[4] or "",
-            "transcript": json.loads(row[5]),
-        }
-
-    def save_followup(
+    def add_followup(
         self,
+        *,
         debate_id: int,
         target_role: str,
-        provider: str,
         question_type: str,
         question: str,
         answer: str,
-        metadata: Dict[str, Any],
+        engine: str,
+        model: str,
     ) -> int:
         con = self._connect()
         cur = con.execute(
             """
             INSERT INTO followups(
-                debate_id, created_at, target_role, provider, question_type,
-                question, answer, metadata_json
+                debate_id, created_at, target_role, question_type,
+                question, answer, engine, model
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 debate_id,
                 datetime.now(timezone.utc).isoformat(),
                 target_role,
-                provider,
                 question_type,
                 question,
                 answer,
-                json.dumps(metadata, ensure_ascii=False),
+                engine,
+                model,
             ),
         )
         con.commit()
-        row_id = int(cur.lastrowid)
+        followup_id = int(cur.lastrowid)
         con.close()
-        return row_id
+        return followup_id
 
-    def get_followups(self, debate_id: int) -> List[Dict[str, Any]]:
+    def list_followups(self, debate_id: int) -> List[Dict[str, Any]]:
         con = self._connect()
         rows = con.execute(
-            """
-            SELECT id, created_at, target_role, provider, question_type,
-                   question, answer, metadata_json
-            FROM followups WHERE debate_id = ? ORDER BY id
-            """,
+            "SELECT * FROM followups WHERE debate_id=? ORDER BY id ASC",
             (debate_id,),
         ).fetchall()
         con.close()
-        return [
-            {
-                "id": row[0],
-                "created_at": row[1],
-                "target_role": row[2],
-                "provider": row[3],
-                "question_type": row[4],
-                "question": row[5],
-                "answer": row[6],
-                "metadata": json.loads(row[7] or "{}"),
-            }
-            for row in rows
-        ]
+        return [dict(row) for row in rows]
+
+    def get_debate(self, debate_id: int) -> Optional[Dict[str, Any]]:
+        con = self._connect()
+        row = con.execute("SELECT * FROM debates WHERE id=?", (debate_id,)).fetchone()
+        con.close()
+        if row is None:
+            return None
+        data = dict(row)
+        try:
+            transcript = json.loads(data.get("transcript_json") or "{}")
+        except json.JSONDecodeError:
+            transcript = {}
+        transcript.setdefault("debate_id", debate_id)
+        transcript.setdefault("version", data.get("version") or "legacy")
+        transcript.setdefault("topic", data.get("topic") or "")
+        transcript.setdefault("target", data.get("target") or "")
+        transcript.setdefault("constraints", data.get("constraints_text") or "")
+        transcript.setdefault("goal", data.get("goal") or "")
+        transcript.setdefault("context", data.get("context") or "")
+        transcript.setdefault("research", data.get("research") or "")
+        transcript.setdefault("verdict", data.get("verdict") or "")
+        transcript["followups"] = self.list_followups(debate_id)
+        return transcript
+
+    def recall(self, query: str, limit: int = 10) -> List[Tuple[int, str, str, str]]:
+        words = [word for word in query.replace("\n", " ").split() if len(word) >= 2][:8]
+        if not words:
+            return []
+        clauses: List[str] = []
+        params: List[Any] = []
+        for word in words:
+            like = f"%{word}%"
+            clauses.append(
+                "(topic LIKE ? OR context LIKE ? OR target LIKE ? OR constraints_text LIKE ? OR goal LIKE ?)"
+            )
+            params.extend([like, like, like, like, like])
+        params.append(limit)
+        con = self._connect()
+        rows = con.execute(
+            f"""
+            SELECT id, created_at, topic, verdict
+            FROM debates
+            WHERE {' OR '.join(clauses)}
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            params,
+        ).fetchall()
+        con.close()
+        return [(int(row[0]), str(row[1]), str(row[2]), str(row[3] or "")) for row in rows]
