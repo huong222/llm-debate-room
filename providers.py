@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import re
 import time
 from dataclasses import asdict, dataclass, field
@@ -8,7 +7,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 
-VERSION = "프로토-1.1234569"
+VERSION = "프로토-1.1234571"
 
 
 @dataclass(frozen=True)
@@ -22,7 +21,6 @@ class EngineConfig:
     base_url: str = ""
     input_char_limit: int = 24000
     temperature: float = 0.35
-    extra_headers: Dict[str, str] = field(default_factory=dict)
 
 
 @dataclass
@@ -41,7 +39,6 @@ class CallResult:
     warnings: List[str] = field(default_factory=list)
     fallback_history: List[str] = field(default_factory=list)
     prompt_chars: int = 0
-    prompt_excerpt: str = ""
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -66,7 +63,11 @@ class ProviderState:
         return True, ""
 
     def consume(self, engine: EngineConfig) -> None:
-        self.calls[engine.group] = self.calls.get(engine.group, 0) + 1
+        used = self.calls.get(engine.group, 0)
+        limit = self.budgets.get(engine.group, 0)
+        if limit > 0 and used >= limit:
+            raise RuntimeError(f"{engine.group} 호출 예산 소진({used}/{limit})")
+        self.calls[engine.group] = used + 1
 
     def block(self, engine: EngineConfig, reason: str) -> None:
         self.disabled_groups[engine.group] = reason
@@ -114,9 +115,14 @@ def _usage(payload: Dict[str, Any]) -> Tuple[Optional[int], Optional[int], Optio
 
 
 def _post(url: str, headers: Dict[str, str], body: Dict[str, Any], timeout: int = 180) -> Dict[str, Any]:
-    response = requests.post(url, headers=headers, json=body, timeout=timeout)
+    try:
+        response = requests.post(url, headers=headers, json=body, timeout=timeout)
+    except requests.RequestException as exc:
+        # URL에 Gemini key가 포함될 수 있으므로 원문 exception/URL을 그대로 출력하지 않는다.
+        raise ProviderFailure(f"네트워크 요청 실패: {type(exc).__name__}", category="retryable") from exc
+
     if not response.ok:
-        text = response.text[:2500]
+        text = response.text[:1800]
         raise ProviderFailure(
             f"HTTP {response.status_code}: {text}",
             category=_error_category(response.status_code, text),
@@ -125,14 +131,13 @@ def _post(url: str, headers: Dict[str, str], body: Dict[str, Any], timeout: int 
     try:
         return response.json()
     except Exception as exc:
-        raise ProviderFailure(f"JSON 응답 해석 실패: {exc}", category="other") from exc
+        raise ProviderFailure("JSON 응답 해석 실패", category="other") from exc
 
 
 def _call_openai_compatible(engine: EngineConfig, system: str, prompt: str, max_tokens: int) -> CallResult:
     headers = {
         "Authorization": f"Bearer {engine.api_key.strip()}",
         "Content-Type": "application/json",
-        **engine.extra_headers,
     }
     body: Dict[str, Any] = {
         "model": engine.model.strip(),
@@ -146,6 +151,7 @@ def _call_openai_compatible(engine: EngineConfig, system: str, prompt: str, max_
     }
     if engine.group == "Groq" and "gpt-oss" in engine.model.lower():
         body["reasoning_effort"] = "low"
+
     payload = _post(f"{engine.base_url}/chat/completions", headers, body)
     choices = payload.get("choices") or []
     if not choices:
@@ -209,7 +215,6 @@ def _call_engine(engine: EngineConfig, system: str, prompt: str, max_tokens: int
     else:
         result = _call_openai_compatible(engine, system, prompt, max_tokens)
     result.prompt_chars = len(prompt)
-    result.prompt_excerpt = compact_text(prompt, 1800)
     return result
 
 
@@ -240,6 +245,7 @@ def call_with_fallback(
         if not ok:
             history.append(f"{engine.label}: {reason}")
             continue
+
         try:
             state.consume(engine)
             result = _call_engine(engine, system, prompt, max_tokens)
@@ -261,9 +267,13 @@ def call_with_fallback(
                 full_text += "\n" + more.text
                 result.finish_reason = more.finish_reason
                 result.continuations += 1
+                result.output_tokens = (result.output_tokens or 0) + (more.output_tokens or 0)
+                result.total_tokens = (result.total_tokens or 0) + (more.total_tokens or 0)
+
             result.text = full_text.strip()
             state.record(result)
             return result
+
         except ProviderFailure as exc:
             last_error = exc
             history.append(f"{engine.label}: {exc}")
@@ -274,10 +284,10 @@ def call_with_fallback(
             continue
         except Exception as exc:
             last_error = exc
-            history.append(f"{engine.label}: {exc}")
+            history.append(f"{engine.label}: {type(exc).__name__}")
             continue
 
-    raise RuntimeError("모든 엔진 호출 실패: " + " | ".join(history or [str(last_error or "원인 없음")]))
+    raise RuntimeError("모든 엔진 호출 실패: " + " | ".join(history or [type(last_error).__name__ if last_error else "원인 없음"]))
 
 
 def validate_research(text: str) -> Dict[str, Any]:
@@ -314,7 +324,7 @@ def research_with_groq(api_key: str, query: str, model: str = "groq/compound-min
         temperature=0.2,
     )
     system = (
-        "공용 Evidence Researcher다. 반드시 실제 웹검색 결과를 사용하고, 핵심 주장마다 출처 URL을 붙여라. "
+        "공용 Evidence Researcher다. 반드시 실제 웹검색 결과를 사용하고 핵심 주장마다 출처 URL을 붙여라. "
         "최소 2개의 실제 URL을 포함하라. 검색하지 못했다면 추측으로 메우지 말고 실패를 명시하라."
     )
     result = _call_engine(engine, system, compact_text(query, 14000), 1800)
@@ -324,38 +334,52 @@ def research_with_groq(api_key: str, query: str, model: str = "groq/compound-min
 def build_engines(keys: Dict[str, str], models: Dict[str, str]) -> Dict[str, EngineConfig]:
     return {
         "gemini": EngineConfig(
-            engine_id="gemini", label="Gemini", group="Gemini", kind="gemini",
-            model=models["gemini"], api_key=keys.get("Gemini", ""), input_char_limit=24000,
+            engine_id="gemini",
+            label="Gemini",
+            group="Gemini",
+            kind="gemini",
+            model=models["gemini"],
+            api_key=keys.get("Gemini", ""),
+            input_char_limit=24000,
         ),
         "groq": EngineConfig(
-            engine_id="groq", label="Groq GPT-OSS", group="Groq", kind="openai",
-            model=models["groq"], api_key=keys.get("Groq", ""), base_url="https://api.groq.com/openai/v1",
+            engine_id="groq",
+            label="Groq GPT-OSS",
+            group="Groq",
+            kind="openai",
+            model=models["groq"],
+            api_key=keys.get("Groq", ""),
+            base_url="https://api.groq.com/openai/v1",
             input_char_limit=17000,
         ),
         "cerebras": EngineConfig(
-            engine_id="cerebras", label="Cerebras", group="Cerebras", kind="openai",
-            model=models["cerebras"], api_key=keys.get("Cerebras", ""), base_url="https://api.cerebras.ai/v1",
+            engine_id="cerebras",
+            label="Cerebras GPT-OSS",
+            group="Cerebras",
+            kind="openai",
+            model=models["cerebras"],
+            api_key=keys.get("Cerebras", ""),
+            base_url="https://api.cerebras.ai/v1",
             input_char_limit=24000,
         ),
         "nvidia_super": EngineConfig(
-            engine_id="nvidia_super", label="NVIDIA Nemotron Super", group="NVIDIA", kind="openai",
-            model=models["nvidia_super"], api_key=keys.get("NVIDIA", ""), base_url="https://integrate.api.nvidia.com/v1",
+            engine_id="nvidia_super",
+            label="NVIDIA Nemotron Super",
+            group="NVIDIA",
+            kind="openai",
+            model=models["nvidia_super"],
+            api_key=keys.get("NVIDIA", ""),
+            base_url="https://integrate.api.nvidia.com/v1",
             input_char_limit=28000,
         ),
         "nvidia_ultra": EngineConfig(
-            engine_id="nvidia_ultra", label="NVIDIA Nemotron Ultra", group="NVIDIA", kind="openai",
-            model=models["nvidia_ultra"], api_key=keys.get("NVIDIA", ""), base_url="https://integrate.api.nvidia.com/v1",
+            engine_id="nvidia_ultra",
+            label="NVIDIA Nemotron Ultra",
+            group="NVIDIA",
+            kind="openai",
+            model=models["nvidia_ultra"],
+            api_key=keys.get("NVIDIA", ""),
+            base_url="https://integrate.api.nvidia.com/v1",
             input_char_limit=28000,
-        ),
-        "openrouter": EngineConfig(
-            engine_id="openrouter", label="OpenRouter", group="OpenRouter", kind="openai",
-            model=models["openrouter"], api_key=keys.get("OpenRouter", ""), base_url="https://openrouter.ai/api/v1",
-            input_char_limit=22000,
-            extra_headers={"HTTP-Referer": "http://localhost:8501", "X-Title": "LLM Debate Room"},
-        ),
-        "cohere": EngineConfig(
-            engine_id="cohere", label="Cohere", group="Cohere", kind="openai",
-            model=models["cohere"], api_key=keys.get("Cohere", ""), base_url="https://api.cohere.ai/compatibility/v1",
-            input_char_limit=22000,
         ),
     }
