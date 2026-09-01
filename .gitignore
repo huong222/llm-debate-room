@@ -8,3 +8,9 @@ __pycache__/
 data/*.sqlite3
 data/*.db
 .streamlit/secrets.toml
+
+# 실수로 프로젝트 폴더에 들어온 개인/설치/압축 파일 차단
+*.hwp
+*.hwpx
+*.exe
+*.zip
