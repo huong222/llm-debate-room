@@ -1,18 +1,32 @@
 # 모델 배치 한눈에 보기
 
-현재 브랜치: `proto-1.1234569-ready`
+현재 앱 버전: `프로토-1.1234571`
+현재 작업 브랜치: `proto-1.1234569`
+
+## 실제 사용하는 공급자
+
+| 공급자 | API 키 | 사용 모델 |
+|---|---|---|
+| Gemini | Gemini 키 | `gemini-3.5-flash-lite` |
+| Groq | Groq 키 | `openai/gpt-oss-120b` + 웹조사 `groq/compound-mini` |
+| Cerebras | Cerebras 키 | `gpt-oss-120b` |
+| NVIDIA NIM | NVIDIA 키 1개 | Nemotron Super + Nemotron Ultra |
+
+OpenRouter / Cohere / Mistral / Cloudflare는 사용하지 않습니다.
+
+## 역할 배치
 
 | 역할 | 기본 엔진 | 목적 |
 |---|---|---|
 | Analyst | Gemini | 기본 가설과 실행 가능한 해법 |
 | Contrarian | Groq GPT-OSS | 반례·숨은 전제·과장 공격 |
 | Alternative | Cerebras GPT-OSS | 제3의 설명과 누락 변수 |
-| Red Team | OpenRouter | 실패 시나리오와 오판 비용 |
-| Evidence Verifier | Cohere | 주장과 자료의 연결 검증 |
-| Consistency Auditor | NVIDIA Nemotron Super | 조건 위반·자기모순 감사 |
+| Red Team | NVIDIA Nemotron Super | 실패 시나리오와 오판 비용 |
+| Evidence Verifier | NVIDIA Nemotron Super | 주장과 자료의 연결 검증 |
+| Consistency Auditor | Cerebras GPT-OSS | 조건 위반·자기모순 감사 |
 | Judge | NVIDIA Nemotron Ultra | 최종 판결 |
 
-## 기본 모델 ID
+## 모델 ID
 
 ```text
 Gemini         gemini-3.5-flash-lite
@@ -20,11 +34,11 @@ Groq           openai/gpt-oss-120b
 Cerebras       gpt-oss-120b
 NVIDIA Super   nvidia/nemotron-3-super-120b-a12b
 NVIDIA Ultra   nvidia/nemotron-3-ultra-550b-a55b
-OpenRouter     qwen/qwen3-4b:free
-Cohere         command-a-plus-05-2026
 ```
 
-모델 ID는 공급자 측에서 바뀔 수 있으므로 실행 화면 왼쪽에서 수정할 수 있습니다.
+NVIDIA는 API 키를 두 개 쓰는 것이 아니라 **NVIDIA NIM 키 하나로 Super와 Ultra를 모두 호출**합니다.
+
+모델 ID는 공급자 측에서 바뀔 수 있으므로 실행 화면의 `모델 이름`에서 수정할 수 있습니다.
 
 ## 토론 순서
 
@@ -32,18 +46,20 @@ Cohere         command-a-plus-05-2026
 질문 입력
   ↓
 4개 독립 분석
-  ├─ Analyst
-  ├─ Contrarian
-  ├─ Alternative
-  └─ Red Team
+  ├─ Analyst / Gemini
+  ├─ Contrarian / Groq
+  ├─ Alternative / Cerebras
+  └─ Red Team / NVIDIA Super
   ↓
-공용 웹조사 + Evidence Verifier
+Groq 공용 웹조사
+  ↓
+Evidence Verifier / NVIDIA Super
   ↓
 상호 반박
   ↓
-Consistency Auditor
+Consistency Auditor / Cerebras
   ↓
-Judge
+Judge / NVIDIA Ultra
   ↓
 SQLite 저장
   ↓
