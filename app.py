@@ -35,43 +35,40 @@ APP_DIR = Path(__file__).resolve().parent
 load_dotenv(APP_DIR / ".env")
 MEMORY = MemoryStore(APP_DIR / "data" / "memory.sqlite3")
 
+# 실제로 준비한 API만 사용한다.
+# NVIDIA API 키 하나로 Nemotron Super / Ultra 두 모델을 사용한다.
 ROLE_ENGINE_DEFAULTS = {
     "Analyst": "gemini",
     "Contrarian": "groq",
     "Alternative": "cerebras",
-    "Red Team": "openrouter",
-    "Verifier": "cohere",
-    "Auditor": "nvidia_super",
+    "Red Team": "nvidia_super",
+    "Verifier": "nvidia_super",
+    "Auditor": "cerebras",
     "Judge": "nvidia_ultra",
 }
 
 FALLBACKS = {
-    "Analyst": ["cerebras", "nvidia_super", "groq", "cohere", "openrouter", "nvidia_ultra"],
-    "Contrarian": ["cerebras", "nvidia_super", "openrouter", "gemini", "cohere", "nvidia_ultra"],
-    "Alternative": ["openrouter", "gemini", "nvidia_super", "groq", "cohere", "nvidia_ultra"],
-    "Red Team": ["groq", "cerebras", "nvidia_super", "gemini", "cohere", "nvidia_ultra"],
-    "Verifier": ["nvidia_super", "cerebras", "gemini", "groq", "openrouter", "nvidia_ultra"],
-    "Auditor": ["cerebras", "cohere", "gemini", "groq", "openrouter", "nvidia_ultra"],
-    "Judge": ["nvidia_super", "cerebras", "gemini", "cohere", "groq", "openrouter"],
+    "Analyst": ["cerebras", "nvidia_super", "groq", "nvidia_ultra"],
+    "Contrarian": ["cerebras", "nvidia_super", "gemini", "nvidia_ultra"],
+    "Alternative": ["nvidia_super", "groq", "gemini", "nvidia_ultra"],
+    "Red Team": ["cerebras", "groq", "gemini", "nvidia_ultra"],
+    "Verifier": ["cerebras", "groq", "gemini", "nvidia_ultra"],
+    "Auditor": ["nvidia_super", "groq", "gemini", "nvidia_ultra"],
+    "Judge": ["nvidia_super", "cerebras", "gemini", "groq"],
 }
 
 ENGINE_LABELS = {
     "gemini": "Gemini",
     "groq": "Groq GPT-OSS",
-    "cerebras": "Cerebras",
+    "cerebras": "Cerebras GPT-OSS",
     "nvidia_super": "NVIDIA Nemotron Super",
     "nvidia_ultra": "NVIDIA Nemotron Ultra",
-    "openrouter": "OpenRouter",
-    "cohere": "Cohere",
 }
-
 
 st.set_page_config(page_title=f"LLM Debate Room {VERSION}", layout="wide")
 
 if "current_debate" not in st.session_state:
     st.session_state.current_debate = None
-if "last_error" not in st.session_state:
-    st.session_state.last_error = ""
 
 
 def as_result_dict(result: CallResult) -> Dict[str, Any]:
@@ -161,6 +158,15 @@ def run_role(
     return as_result_dict(result)
 
 
+def error_result(exc: Exception, label: str = "ERROR") -> Dict[str, Any]:
+    return {
+        "text": f"[{label}] {exc}",
+        "actual_engine": "ERROR",
+        "model": "-",
+        "finish_reason": "error",
+    }
+
+
 def render_result(title: str, result: Dict[str, Any]) -> None:
     st.markdown(f"### {title}")
     st.caption(
@@ -174,19 +180,9 @@ def render_result(title: str, result: Dict[str, Any]) -> None:
         c2.metric("출력 토큰", result.get("output_tokens") or "-")
         c3.metric("이어쓰기", result.get("continuations") or 0)
         c4.metric("프롬프트 문자", result.get("prompt_chars") or 0)
-        warnings = result.get("warnings") or []
         fallbacks = result.get("fallback_history") or []
-        if warnings:
-            st.warning("\n".join(f"- {item}" for item in warnings))
         if fallbacks:
             st.info("대체 경로\n" + "\n".join(f"- {item}" for item in fallbacks))
-        st.text_area(
-            "모델에 전달된 프롬프트 일부",
-            value=result.get("prompt_excerpt") or "",
-            height=180,
-            disabled=True,
-            key=f"prompt_{title}_{hash(result.get('prompt_excerpt') or '')}",
-        )
 
 
 def render_role_tabs(results: Dict[str, Dict[str, Any]], prefix: str) -> None:
@@ -284,78 +280,81 @@ def result_for_target(debate: Dict[str, Any], target: str) -> Dict[str, Any]:
 
 st.title(f"🧠 LLM Debate Room — {VERSION}")
 st.caption(
-    "Gemini · Groq · Cerebras · NVIDIA Nemotron · OpenRouter · Cohere | "
+    "Gemini · Groq · Cerebras · NVIDIA NIM (Nemotron Super + Ultra) | "
     "독립 분석 → 증거 검증 → 반박 → 일관성 감사 → 판결"
 )
 
 with st.sidebar:
-    st.header("API 키")
+    st.header("API 키 · 실제 준비한 4개만")
     keys = {
         "Gemini": st.text_input("Gemini", value=os.getenv("GEMINI_API_KEY", ""), type="password"),
         "Groq": st.text_input("Groq", value=os.getenv("GROQ_API_KEY", ""), type="password"),
         "Cerebras": st.text_input("Cerebras", value=os.getenv("CEREBRAS_API_KEY", ""), type="password"),
         "NVIDIA": st.text_input("NVIDIA NIM", value=os.getenv("NVIDIA_API_KEY", ""), type="password"),
-        "OpenRouter": st.text_input("OpenRouter", value=os.getenv("OPENROUTER_API_KEY", ""), type="password"),
-        "Cohere": st.text_input("Cohere", value=os.getenv("COHERE_API_KEY", ""), type="password"),
     }
 
-    st.header("모델")
-    models = {
-        "gemini": st.text_input("Gemini model", value=os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite")),
-        "groq": st.text_input("Groq model", value=os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")),
-        "cerebras": st.text_input("Cerebras model", value=os.getenv("CEREBRAS_MODEL", "gpt-oss-120b")),
-        "nvidia_super": st.text_input(
-            "NVIDIA Super",
-            value=os.getenv("NVIDIA_SUPER_MODEL", "nvidia/nemotron-3-super-120b-a12b"),
-        ),
-        "nvidia_ultra": st.text_input(
-            "NVIDIA Ultra",
-            value=os.getenv("NVIDIA_ULTRA_MODEL", "nvidia/nemotron-3-ultra-550b-a55b"),
-        ),
-        "openrouter": st.text_input(
-            "OpenRouter model",
-            value=os.getenv("OPENROUTER_MODEL", "qwen/qwen3-4b:free"),
-        ),
-        "cohere": st.text_input(
-            "Cohere model",
-            value=os.getenv("COHERE_MODEL", "command-a-plus-05-2026"),
-        ),
-    }
+    ready = [name for name, value in keys.items() if value]
+    st.caption("입력됨: " + (" · ".join(ready) if ready else "없음"))
+
+    with st.expander("모델 이름", expanded=False):
+        models = {
+            "gemini": st.text_input("Gemini model", value=os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite")),
+            "groq": st.text_input("Groq model", value=os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")),
+            "cerebras": st.text_input("Cerebras model", value=os.getenv("CEREBRAS_MODEL", "gpt-oss-120b")),
+            "nvidia_super": st.text_input(
+                "NVIDIA Nemotron Super",
+                value=os.getenv("NVIDIA_SUPER_MODEL", "nvidia/nemotron-3-super-120b-a12b"),
+            ),
+            "nvidia_ultra": st.text_input(
+                "NVIDIA Nemotron Ultra",
+                value=os.getenv("NVIDIA_ULTRA_MODEL", "nvidia/nemotron-3-ultra-550b-a55b"),
+            ),
+        }
+
+    st.header("기본 역할 배치")
+    st.caption(
+        "Analyst → Gemini\n\n"
+        "Contrarian → Groq\n\n"
+        "Alternative → Cerebras\n\n"
+        "Red Team / Verifier → NVIDIA Super\n\n"
+        "Auditor → Cerebras\n\n"
+        "Judge → NVIDIA Ultra"
+    )
 
     st.header("토론 설정")
     web_research = st.toggle("Groq 공용 웹조사", value=True)
     cross_rounds = st.slider("반박 라운드", 0, 2, 1)
-    general_tokens = st.slider("일반 발언 최대 토큰", 600, 2600, 1400, 100)
-    verifier_tokens = st.slider("Verifier 최대 토큰", 600, 2600, 1400, 100)
-    auditor_tokens = st.slider("Auditor 최대 토큰", 600, 3000, 1600, 100)
-    judge_tokens = st.slider("Judge 최대 토큰", 800, 5000, 2600, 100)
-    followup_tokens = st.slider("후속 답변 최대 토큰", 600, 3000, 1600, 100)
+    general_tokens = st.slider("일반 발언 최대 토큰", 600, 2600, 1300, 100)
+    verifier_tokens = st.slider("Verifier 최대 토큰", 600, 2600, 1300, 100)
+    auditor_tokens = st.slider("Auditor 최대 토큰", 600, 3000, 1500, 100)
+    judge_tokens = st.slider("Judge 최대 토큰", 800, 5000, 2400, 100)
+    followup_tokens = st.slider("후속 답변 최대 토큰", 600, 3000, 1500, 100)
     continuations = st.slider("출력 잘림 자동 이어쓰기", 0, 2, 1)
     memory_n = st.slider("관련 과거 토론", 0, 10, 4)
 
-    st.header("역할별 엔진")
-    engine_options = list(ENGINE_LABELS)
-    role_engine: Dict[str, str] = {}
-    for role in [*ROLE_RULES, "Verifier", "Auditor", "Judge"]:
-        default_id = ROLE_ENGINE_DEFAULTS[role]
-        role_engine[role] = st.selectbox(
-            role,
-            engine_options,
-            index=engine_options.index(default_id),
-            format_func=lambda x: ENGINE_LABELS[x],
-            key=f"role_engine_{role}",
-        )
+    with st.expander("고급 · 역할별 모델 바꾸기", expanded=False):
+        engine_options = list(ENGINE_LABELS)
+        role_engine: Dict[str, str] = {}
+        for role in [*ROLE_RULES, "Verifier", "Auditor", "Judge"]:
+            default_id = ROLE_ENGINE_DEFAULTS[role]
+            role_engine[role] = st.selectbox(
+                role,
+                engine_options,
+                index=engine_options.index(default_id),
+                format_func=lambda x: ENGINE_LABELS[x],
+                key=f"role_engine_{role}",
+            )
+    # expander를 닫아도 변수는 매 rerun마다 생성된다.
+    if "role_engine" not in locals():
+        role_engine = dict(ROLE_ENGINE_DEFAULTS)
 
-    st.header("이번 토론 호출 예산")
-    budgets = {
-        "Gemini": st.number_input("Gemini", min_value=0, max_value=30, value=3),
-        "Groq": st.number_input("Groq", min_value=0, max_value=40, value=10),
-        "Cerebras": st.number_input("Cerebras", min_value=0, max_value=30, value=7),
-        "NVIDIA": st.number_input("NVIDIA", min_value=0, max_value=30, value=6),
-        "OpenRouter": st.number_input("OpenRouter", min_value=0, max_value=30, value=5),
-        "Cohere": st.number_input("Cohere", min_value=0, max_value=30, value=5),
-    }
-    st.caption("GitHub Models는 2026-07-30 서비스 종료로 제외했습니다.")
+    with st.expander("고급 · 이번 토론 호출 예산", expanded=False):
+        budgets = {
+            "Gemini": st.number_input("Gemini", min_value=0, max_value=30, value=3),
+            "Groq": st.number_input("Groq", min_value=0, max_value=40, value=10),
+            "Cerebras": st.number_input("Cerebras", min_value=0, max_value=30, value=8),
+            "NVIDIA": st.number_input("NVIDIA", min_value=0, max_value=30, value=8),
+        }
 
 engines = build_engines(keys, models)
 
@@ -403,20 +402,13 @@ if submitted:
             "reasons": ["웹조사 사용 안 함"],
         }
         if web_research:
-            with st.spinner("공용 웹조사 중..."):
+            with st.spinner("Groq 공용 웹조사 중..."):
                 try:
-                    research_text, research_validation = research_with_groq(
-                        keys.get("Groq", ""),
-                        user_packet,
-                    )
+                    research_text, research_validation = research_with_groq(keys.get("Groq", ""), user_packet)
                 except Exception as exc:
                     research_text = f"[공용 웹조사 실패: {exc}]"
-                    research_validation = {
-                        "usable": False,
-                        "urls": [],
-                        "reasons": [str(exc)],
-                    }
-                    st.warning("공용 웹조사는 실패했지만 독립 분석은 계속합니다.")
+                    research_validation = {"usable": False, "urls": [], "reasons": [str(exc)]}
+                    st.warning("공용 웹조사는 실패했지만 토론은 계속합니다.")
 
         initial: Dict[str, Dict[str, Any]] = {}
         with st.status("독립 분석 실행 중...", expanded=True) as status:
@@ -440,12 +432,7 @@ if submitted:
                         continuations=continuations,
                     )
                 except Exception as exc:
-                    initial[role] = {
-                        "text": f"[ERROR] {exc}",
-                        "actual_engine": "ERROR",
-                        "model": "-",
-                        "finish_reason": "error",
-                    }
+                    initial[role] = error_result(exc)
             status.update(label="독립 분석 완료", state="complete")
 
         evidence_label = "VERIFIED-EVIDENCE" if research_validation.get("usable") else "UNVERIFIED-RESEARCH"
@@ -472,12 +459,7 @@ if submitted:
                 continuations=continuations,
             )
         except Exception as exc:
-            verifier = {
-                "text": f"[ERROR] {exc}",
-                "actual_engine": "ERROR",
-                "model": "-",
-                "finish_reason": "error",
-            }
+            verifier = error_result(exc)
 
         rounds: List[Dict[str, Any]] = []
         current = initial
@@ -516,12 +498,7 @@ if submitted:
                         continuations=continuations,
                     )
                 except Exception as exc:
-                    next_round[role] = {
-                        "text": f"[ERROR] {exc}",
-                        "actual_engine": "ERROR",
-                        "model": "-",
-                        "finish_reason": "error",
-                    }
+                    next_round[role] = error_result(exc)
             rounds.append({"round": round_no, "responses": next_round})
             current = next_round
 
@@ -555,12 +532,7 @@ if submitted:
                 continuations=continuations,
             )
         except Exception as exc:
-            auditor = {
-                "text": f"[ERROR] {exc}",
-                "actual_engine": "ERROR",
-                "model": "-",
-                "finish_reason": "error",
-            }
+            auditor = error_result(exc)
 
         judge_prompt = f"""
 {user_packet}
@@ -591,12 +563,7 @@ if submitted:
                 continuations=continuations,
             )
         except Exception as exc:
-            verdict_result = {
-                "text": f"[Judge ERROR] {exc}",
-                "actual_engine": "ERROR",
-                "model": "-",
-                "finish_reason": "error",
-            }
+            verdict_result = error_result(exc, "Judge ERROR")
 
         debate: Dict[str, Any] = {
             "version": VERSION,
@@ -674,7 +641,9 @@ if st.session_state.current_debate:
             requested = target_result.get("actual_engine")
             if requested not in engines:
                 requested = role_engine.get(follow_target, role_engine["Judge"])
-            follow_state = ProviderState(budgets={key: max(2, int(value)) for key, value in budgets.items()})
+            follow_state = ProviderState(
+                budgets={key: max(2, int(value)) for key, value in budgets.items()}
+            )
             system = FOLLOWUP_SYSTEM_TEMPLATE.format(
                 target=follow_target,
                 question_type=question_type,
