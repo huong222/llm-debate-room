@@ -8,7 +8,7 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import requests
 
-VERSION = "프로토-1.1234571-fix1"
+VERSION = "프로토-1.1234571-fix2"
 
 
 @dataclass(frozen=True)
@@ -60,19 +60,13 @@ class ProviderState:
                 return False, f"{engine.group} 차단됨: {self.disabled_groups[engine.group]}"
             if not engine.api_key:
                 return False, f"{engine.label} API 키 없음"
-            used = self.calls.get(engine.group, 0)
-            limit = self.budgets.get(engine.group, 0)
-            if limit > 0 and used >= limit:
-                return False, f"{engine.group} 호출 예산 소진({used}/{limit})"
+            # 앱 내부 호출예산 때문에 토론 중간에 역할/Judge가 죽는 문제를 막는다.
+            # budgets 값은 화면의 참고용 메타데이터로만 유지한다.
             return True, ""
 
     def consume(self, engine: EngineConfig) -> None:
         with self.lock:
-            used = self.calls.get(engine.group, 0)
-            limit = self.budgets.get(engine.group, 0)
-            if limit > 0 and used >= limit:
-                raise RuntimeError(f"{engine.group} 호출 예산 소진({used}/{limit})")
-            self.calls[engine.group] = used + 1
+            self.calls[engine.group] = self.calls.get(engine.group, 0) + 1
 
     def block(self, engine: EngineConfig, reason: str) -> None:
         with self.lock:
@@ -106,7 +100,12 @@ def _error_category(status: int, body: str) -> str:
         return "auth"
     if status == 413 or any(x in lower for x in ("context length", "request too large", "input too long")):
         return "too_large"
-    if status == 429 or any(x in lower for x in ("quota", "rate limit", "too many requests")):
+    if status == 429:
+        # 429는 순간 rate-limit인 경우가 많다. 명시적 quota 소진일 때만 provider를 차단한다.
+        if any(x in lower for x in ("insufficient_quota", "quota exhausted", "quota exceeded", "credit balance")):
+            return "quota"
+        return "retryable"
+    if any(x in lower for x in ("insufficient_quota", "quota exhausted", "quota exceeded")):
         return "quota"
     if status >= 500:
         return "retryable"
@@ -164,9 +163,7 @@ def _message_text(message: Dict[str, Any]) -> str:
                 parts.append(str(item))
         if parts:
             return "\n".join(parts).strip()
-    reasoning = message.get("reasoning_content") or message.get("reasoning")
-    if isinstance(reasoning, str) and reasoning.strip():
-        return reasoning.strip()
+    # reasoning/reasoning_content는 내부 추론일 수 있으므로 사용자 출력으로 사용하지 않는다.
     return ""
 
 
@@ -201,7 +198,7 @@ def _call_openai_compatible(engine: EngineConfig, system: str, prompt: str, max_
     message = choice.get("message") or {}
     text = _message_text(message)
     if not text:
-        raise ProviderFailure("모델이 빈 응답을 반환함", category="empty")
+        raise ProviderFailure("최종 답변 content가 비어 있음", category="empty")
     inp, out, total = _usage(payload)
     return CallResult(
         text=text,
@@ -301,7 +298,7 @@ def call_with_fallback(
                     prompt
                     + "\n\n[이전 출력]\n"
                     + compact_text(full_text, 7000)
-                    + "\n\n중복 없이 바로 이어서 작성하라."
+                    + "\n\n중복 없이 바로 이어서 한국어로 작성하라."
                 )
                 state.consume(engine)
                 more = _call_engine(engine, system, follow_prompt, max_tokens)
@@ -321,7 +318,7 @@ def call_with_fallback(
             if exc.category in ("auth", "quota"):
                 state.block(engine, str(exc))
             if exc.category == "retryable":
-                time.sleep(0.15)
+                time.sleep(0.25)
             continue
         except Exception as exc:
             last_error = exc
@@ -384,31 +381,35 @@ def research_with_groq(
     if not api_key:
         raise RuntimeError("Groq API 키가 없어 웹조사를 실행할 수 없음")
 
+    # Compound Mini는 웹검색을 서버 측에서 자동 수행한다. 검색 단계는 토론 전체를
+    # 오래 붙잡지 않도록 짧은 timeout을 사용하고, 실패하면 본 토론은 즉시 계속한다.
     body: Dict[str, Any] = {
         "model": model,
         "messages": [
             {
                 "role": "system",
                 "content": (
-                    "공용 Evidence Researcher다. 실제 웹검색을 사용해 핵심 사실을 짧게 조사하라. "
-                    "가능하면 서로 다른 출처를 사용하고, 추측을 사실처럼 쓰지 마라."
+                    "공용 Evidence Researcher다. 반드시 웹검색을 사용해 핵심 사실만 짧게 조사하라. "
+                    "가능하면 서로 다른 출처를 사용하고 추측을 사실처럼 쓰지 마라. "
+                    "최종 출력은 한국어로 작성하되 URL과 고유명사는 원문을 유지하라."
                 ),
             },
-            {"role": "user", "content": compact_text(query, 12000)},
+            {"role": "user", "content": compact_text(query, 10000)},
         ],
-        "max_tokens": 1200,
-        "temperature": 0.15,
+        "max_tokens": 800,
+        "temperature": 0.1,
         "stream": False,
-        "citation_options": "enabled",
+        "compound_custom": {"tools": {"enabled_tools": ["web_search"]}},
     }
     payload = _post(
         "https://api.groq.com/openai/v1/chat/completions",
         {
             "Authorization": f"Bearer {api_key.strip()}",
             "Content-Type": "application/json",
+            "Groq-Model-Version": "latest",
         },
         body,
-        timeout=60,
+        timeout=25,
     )
     choices = payload.get("choices") or []
     if not choices:
@@ -416,7 +417,7 @@ def research_with_groq(
     message = (choices[0] or {}).get("message") or {}
     text = _message_text(message)
     if not text:
-        raise ProviderFailure("Groq 웹조사가 빈 응답을 반환함", category="empty")
+        raise ProviderFailure("Groq 웹조사가 빈 최종 응답을 반환함", category="empty")
 
     urls = _collect_urls(message.get("executed_tools") or [])
     urls.extend(_collect_urls(payload.get("citations") or []))
@@ -439,7 +440,7 @@ def build_engines(keys: Dict[str, str], models: Dict[str, str]) -> Dict[str, Eng
             model=models["gemini"],
             api_key=keys.get("Gemini", ""),
             input_char_limit=24000,
-            timeout=60,
+            timeout=55,
         ),
         "groq": EngineConfig(
             engine_id="groq",
@@ -450,7 +451,7 @@ def build_engines(keys: Dict[str, str], models: Dict[str, str]) -> Dict[str, Eng
             api_key=keys.get("Groq", ""),
             base_url="https://api.groq.com/openai/v1",
             input_char_limit=17000,
-            timeout=60,
+            timeout=50,
         ),
         "cerebras": EngineConfig(
             engine_id="cerebras",
@@ -461,7 +462,7 @@ def build_engines(keys: Dict[str, str], models: Dict[str, str]) -> Dict[str, Eng
             api_key=keys.get("Cerebras", ""),
             base_url="https://api.cerebras.ai/v1",
             input_char_limit=24000,
-            timeout=60,
+            timeout=50,
         ),
         "nvidia_super": EngineConfig(
             engine_id="nvidia_super",
@@ -472,7 +473,7 @@ def build_engines(keys: Dict[str, str], models: Dict[str, str]) -> Dict[str, Eng
             api_key=keys.get("NVIDIA", ""),
             base_url="https://integrate.api.nvidia.com/v1",
             input_char_limit=28000,
-            timeout=75,
+            timeout=65,
         ),
         "nvidia_ultra": EngineConfig(
             engine_id="nvidia_ultra",
@@ -483,6 +484,6 @@ def build_engines(keys: Dict[str, str], models: Dict[str, str]) -> Dict[str, Eng
             api_key=keys.get("NVIDIA", ""),
             base_url="https://integrate.api.nvidia.com/v1",
             input_char_limit=28000,
-            timeout=90,
+            timeout=75,
         ),
     }
