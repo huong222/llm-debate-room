@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import os
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List
@@ -30,13 +32,10 @@ from providers import (
     research_with_groq,
 )
 
-
 APP_DIR = Path(__file__).resolve().parent
 load_dotenv(APP_DIR / ".env")
 MEMORY = MemoryStore(APP_DIR / "data" / "memory.sqlite3")
 
-# 실제로 준비한 API만 사용한다.
-# NVIDIA API 키 하나로 Nemotron Super / Ultra 두 모델을 사용한다.
 ROLE_ENGINE_DEFAULTS = {
     "Analyst": "gemini",
     "Contrarian": "groq",
@@ -47,14 +46,15 @@ ROLE_ENGINE_DEFAULTS = {
     "Judge": "nvidia_ultra",
 }
 
+# 실패 시 모든 공급자를 끝없이 도는 대신 두 개 정도만 대체한다.
 FALLBACKS = {
-    "Analyst": ["cerebras", "nvidia_super", "groq", "nvidia_ultra"],
-    "Contrarian": ["cerebras", "nvidia_super", "gemini", "nvidia_ultra"],
-    "Alternative": ["nvidia_super", "groq", "gemini", "nvidia_ultra"],
-    "Red Team": ["cerebras", "groq", "gemini", "nvidia_ultra"],
-    "Verifier": ["cerebras", "groq", "gemini", "nvidia_ultra"],
-    "Auditor": ["nvidia_super", "groq", "gemini", "nvidia_ultra"],
-    "Judge": ["nvidia_super", "cerebras", "gemini", "groq"],
+    "Analyst": ["cerebras", "groq"],
+    "Contrarian": ["cerebras", "gemini"],
+    "Alternative": ["groq", "gemini"],
+    "Red Team": ["cerebras", "groq"],
+    "Verifier": ["cerebras", "gemini"],
+    "Auditor": ["nvidia_super", "groq"],
+    "Judge": ["nvidia_super", "cerebras"],
 }
 
 ENGINE_LABELS = {
@@ -83,6 +83,15 @@ def get_text(result: Any) -> str:
 
 def clip(text: str, chars: int) -> str:
     return compact_text(text or "", chars)
+
+
+def error_result(exc: Exception, label: str = "ERROR") -> Dict[str, Any]:
+    return {
+        "text": f"[{label}] {exc}",
+        "actual_engine": "ERROR",
+        "model": "-",
+        "finish_reason": "error",
+    }
 
 
 def digest_results(results: Dict[str, Dict[str, Any]], each_chars: int = 2200) -> str:
@@ -158,13 +167,51 @@ def run_role(
     return as_result_dict(result)
 
 
-def error_result(exc: Exception, label: str = "ERROR") -> Dict[str, Any]:
-    return {
-        "text": f"[{label}] {exc}",
-        "actual_engine": "ERROR",
-        "model": "-",
-        "finish_reason": "error",
-    }
+def run_parallel_stage(
+    *,
+    roles: Iterable[str],
+    role_engine: Dict[str, str],
+    engines: Dict[str, Any],
+    state: ProviderState,
+    system_for: Any,
+    prompt_for: Any,
+    max_tokens: int,
+    continuations: int,
+    progress: Any,
+    label: str,
+) -> Dict[str, Dict[str, Any]]:
+    roles = list(roles)
+    results: Dict[str, Dict[str, Any]] = {}
+    started = time.monotonic()
+    progress.write(f"{label}: {len(roles)}개 모델 병렬 호출 시작")
+
+    def worker(role: str) -> Dict[str, Any]:
+        return run_role(
+            role=role,
+            requested_engine=role_engine[role],
+            engines=engines,
+            state=state,
+            system=system_for(role),
+            prompt=prompt_for(role),
+            max_tokens=max_tokens,
+            continuations=continuations,
+        )
+
+    with ThreadPoolExecutor(max_workers=len(roles)) as pool:
+        future_to_role = {pool.submit(worker, role): role for role in roles}
+        for future in as_completed(future_to_role):
+            role = future_to_role[future]
+            try:
+                results[role] = future.result()
+                actual = results[role].get("actual_engine", "?")
+                progress.write(f"✓ {role} 완료 · {actual}")
+            except Exception as exc:
+                results[role] = error_result(exc)
+                progress.write(f"✗ {role} 실패 · {exc}")
+
+    ordered = {role: results[role] for role in roles}
+    progress.write(f"{label} 완료 · {time.monotonic() - started:.1f}초")
+    return ordered
 
 
 def render_result(title: str, result: Dict[str, Any]) -> None:
@@ -207,9 +254,9 @@ def render_debate(debate: Dict[str, Any]) -> None:
     with st.expander("공용 웹조사 / Evidence Brief", expanded=False):
         validation = research.get("validation") or {}
         if validation.get("usable"):
-            st.success(f"검증 통과 · URL {len(validation.get('urls') or [])}개")
+            st.success(f"검색 출처 확인 · URL {len(validation.get('urls') or [])}개")
         else:
-            st.warning("검증 실패 또는 미사용: " + ", ".join(validation.get("reasons") or ["사유 없음"]))
+            st.warning("웹조사 미사용/검증 실패: " + ", ".join(validation.get("reasons") or ["사유 없음"]))
         st.markdown(research.get("text") or "(없음)")
 
     st.subheader("1. 독립 분석")
@@ -236,19 +283,18 @@ def render_debate(debate: Dict[str, Any]) -> None:
 
     diagnostics = debate.get("diagnostics") or []
     with st.expander(f"전체 호출 진단 {len(diagnostics)}건", expanded=False):
-        table = []
-        for item in diagnostics:
-            table.append(
-                {
-                    "요청": item.get("requested_engine"),
-                    "실제": item.get("actual_engine"),
-                    "모델": item.get("model"),
-                    "종료": item.get("finish_reason"),
-                    "입력": item.get("input_tokens"),
-                    "출력": item.get("output_tokens"),
-                    "이어쓰기": item.get("continuations"),
-                }
-            )
+        table = [
+            {
+                "요청": item.get("requested_engine"),
+                "실제": item.get("actual_engine"),
+                "모델": item.get("model"),
+                "종료": item.get("finish_reason"),
+                "입력": item.get("input_tokens"),
+                "출력": item.get("output_tokens"),
+                "이어쓰기": item.get("continuations"),
+            }
+            for item in diagnostics
+        ]
         if table:
             st.dataframe(table, use_container_width=True, hide_index=True)
         else:
@@ -259,7 +305,7 @@ def render_debate(debate: Dict[str, Any]) -> None:
         data=json.dumps(debate, ensure_ascii=False, indent=2),
         file_name=f"debate_{debate.get('debate_id', 'unsaved')}_{VERSION}.json",
         mime="application/json",
-        key=f"download_{debate.get('debate_id', 'unsaved')}",
+        key=f"download_{debate.get('debate_id', 'unsaved')}_{VERSION}",
     )
 
 
@@ -280,19 +326,18 @@ def result_for_target(debate: Dict[str, Any], target: str) -> Dict[str, Any]:
 
 st.title(f"🧠 LLM Debate Room — {VERSION}")
 st.caption(
-    "Gemini · Groq · Cerebras · NVIDIA NIM (Nemotron Super + Ultra) | "
-    "독립 분석 → 증거 검증 → 반박 → 일관성 감사 → 판결"
+    "Gemini · Groq · Cerebras · NVIDIA NIM | "
+    "병렬 독립 분석 → 증거 검증 → 병렬 반박 → 감사 → 판결"
 )
 
 with st.sidebar:
-    st.header("API 키 · 실제 준비한 4개만")
+    st.header("API 키 · 4개 공급자")
     keys = {
         "Gemini": st.text_input("Gemini", value=os.getenv("GEMINI_API_KEY", ""), type="password"),
         "Groq": st.text_input("Groq", value=os.getenv("GROQ_API_KEY", ""), type="password"),
         "Cerebras": st.text_input("Cerebras", value=os.getenv("CEREBRAS_API_KEY", ""), type="password"),
         "NVIDIA": st.text_input("NVIDIA NIM", value=os.getenv("NVIDIA_API_KEY", ""), type="password"),
     }
-
     ready = [name for name, value in keys.items() if value]
     st.caption("입력됨: " + (" · ".join(ready) if ready else "없음"))
 
@@ -311,26 +356,17 @@ with st.sidebar:
             ),
         }
 
-    st.header("기본 역할 배치")
-    st.caption(
-        "Analyst → Gemini\n\n"
-        "Contrarian → Groq\n\n"
-        "Alternative → Cerebras\n\n"
-        "Red Team / Verifier → NVIDIA Super\n\n"
-        "Auditor → Cerebras\n\n"
-        "Judge → NVIDIA Ultra"
-    )
-
     st.header("토론 설정")
     web_research = st.toggle("Groq 공용 웹조사", value=True)
     cross_rounds = st.slider("반박 라운드", 0, 2, 1)
-    general_tokens = st.slider("일반 발언 최대 토큰", 600, 2600, 1300, 100)
-    verifier_tokens = st.slider("Verifier 최대 토큰", 600, 2600, 1300, 100)
-    auditor_tokens = st.slider("Auditor 최대 토큰", 600, 3000, 1500, 100)
-    judge_tokens = st.slider("Judge 최대 토큰", 800, 5000, 2400, 100)
-    followup_tokens = st.slider("후속 답변 최대 토큰", 600, 3000, 1500, 100)
-    continuations = st.slider("출력 잘림 자동 이어쓰기", 0, 2, 1)
+    general_tokens = st.slider("일반 발언 최대 토큰", 500, 2200, 900, 100)
+    verifier_tokens = st.slider("Verifier 최대 토큰", 500, 2200, 900, 100)
+    auditor_tokens = st.slider("Auditor 최대 토큰", 500, 2600, 1000, 100)
+    judge_tokens = st.slider("Judge 최대 토큰", 700, 3600, 1400, 100)
+    followup_tokens = st.slider("후속 답변 최대 토큰", 500, 2400, 1000, 100)
+    continuations = st.slider("출력 잘림 자동 이어쓰기", 0, 2, 0)
     memory_n = st.slider("관련 과거 토론", 0, 10, 4)
+    st.caption("기본값은 속도 우선. 길게 필요할 때만 토큰/이어쓰기를 올리면 됩니다.")
 
     with st.expander("고급 · 역할별 모델 바꾸기", expanded=False):
         engine_options = list(ENGINE_LABELS)
@@ -344,16 +380,13 @@ with st.sidebar:
                 format_func=lambda x: ENGINE_LABELS[x],
                 key=f"role_engine_{role}",
             )
-    # expander를 닫아도 변수는 매 rerun마다 생성된다.
-    if "role_engine" not in locals():
-        role_engine = dict(ROLE_ENGINE_DEFAULTS)
 
     with st.expander("고급 · 이번 토론 호출 예산", expanded=False):
         budgets = {
-            "Gemini": st.number_input("Gemini", min_value=0, max_value=30, value=3),
+            "Gemini": st.number_input("Gemini", min_value=0, max_value=30, value=4),
             "Groq": st.number_input("Groq", min_value=0, max_value=40, value=10),
-            "Cerebras": st.number_input("Cerebras", min_value=0, max_value=30, value=8),
-            "NVIDIA": st.number_input("NVIDIA", min_value=0, max_value=30, value=8),
+            "Cerebras": st.number_input("Cerebras", min_value=0, max_value=30, value=10),
+            "NVIDIA": st.number_input("NVIDIA", min_value=0, max_value=30, value=10),
         }
 
 engines = build_engines(keys, models)
@@ -384,6 +417,7 @@ if submitted:
     elif not any(keys.values()):
         st.error("API 키가 최소 하나는 필요합니다.")
     else:
+        st.session_state.current_debate = None
         state = ProviderState(budgets={key: int(value) for key, value in budgets.items()})
         memories = MEMORY.recall(topic + " " + target, memory_n) if memory_n else []
         user_packet = build_user_packet(
@@ -394,227 +428,263 @@ if submitted:
             context,
             memory_digest(memories),
         )
+        overall_started = time.monotonic()
 
-        research_text = "(웹조사 사용 안 함)"
-        research_validation: Dict[str, Any] = {
-            "usable": False,
-            "urls": [],
-            "reasons": ["웹조사 사용 안 함"],
-        }
-        if web_research:
-            with st.spinner("Groq 공용 웹조사 중..."):
+        with st.status("토론 실행 중 · 현재 단계를 계속 표시합니다", expanded=True) as progress:
+            research_text = "(웹조사 사용 안 함)"
+            research_validation: Dict[str, Any] = {
+                "usable": False,
+                "urls": [],
+                "reasons": ["웹조사 사용 안 함"],
+            }
+            if web_research:
+                progress.write("0/5 · Groq 공용 웹조사 시작")
                 try:
-                    research_text, research_validation = research_with_groq(keys.get("Groq", ""), user_packet)
+                    research_text, research_validation = research_with_groq(
+                        keys.get("Groq", ""),
+                        user_packet,
+                    )
+                    if research_validation.get("usable"):
+                        progress.write(
+                            f"✓ 웹조사 완료 · 출처 {len(research_validation.get('urls') or [])}개"
+                        )
+                    else:
+                        progress.write(
+                            "△ 웹조사 응답은 받았지만 출처 검증 실패 · "
+                            + ", ".join(research_validation.get("reasons") or [])
+                        )
                 except Exception as exc:
                     research_text = f"[공용 웹조사 실패: {exc}]"
-                    research_validation = {"usable": False, "urls": [], "reasons": [str(exc)]}
-                    st.warning("공용 웹조사는 실패했지만 토론은 계속합니다.")
+                    research_validation = {
+                        "usable": False,
+                        "urls": [],
+                        "reasons": [str(exc)],
+                    }
+                    progress.write(f"△ 웹조사 호출 실패 · {exc} · 토론은 계속")
 
-        initial: Dict[str, Dict[str, Any]] = {}
-        with st.status("독립 분석 실행 중...", expanded=True) as status:
-            for role, role_rule in ROLE_RULES.items():
-                st.write(f"{role} 호출")
-                system = INDEPENDENT_SYSTEM_TEMPLATE.format(
+            initial = run_parallel_stage(
+                roles=ROLE_RULES.keys(),
+                role_engine=role_engine,
+                engines=engines,
+                state=state,
+                system_for=lambda role: INDEPENDENT_SYSTEM_TEMPLATE.format(
                     role=role,
-                    role_rule=role_rule,
+                    role_rule=ROLE_RULES[role],
                     constitution=REASONING_CONSTITUTION,
-                )
-                prompt = user_packet + "\n\n다른 모델이나 웹조사 결과를 보지 않고 독립적으로 분석하라."
-                try:
-                    initial[role] = run_role(
-                        role=role,
-                        requested_engine=role_engine[role],
-                        engines=engines,
-                        state=state,
-                        system=system,
-                        prompt=prompt,
-                        max_tokens=general_tokens,
-                        continuations=continuations,
-                    )
-                except Exception as exc:
-                    initial[role] = error_result(exc)
-            status.update(label="독립 분석 완료", state="complete")
+                ),
+                prompt_for=lambda role: (
+                    user_packet + "\n\n다른 모델이나 웹조사 결과를 보지 않고 독립적으로 분석하라."
+                ),
+                max_tokens=general_tokens,
+                continuations=continuations,
+                progress=progress,
+                label="1/5 · 독립 분석",
+            )
 
-        evidence_label = "VERIFIED-EVIDENCE" if research_validation.get("usable") else "UNVERIFIED-RESEARCH"
-        verifier_prompt = f"""
+            evidence_label = (
+                "VERIFIED-EVIDENCE" if research_validation.get("usable") else "UNVERIFIED-RESEARCH"
+            )
+            verifier_prompt = f"""
 {user_packet}
 
 [{evidence_label}]
-{clip(research_text, 7500)}
+{clip(research_text, 6500)}
 
 [독립 분석 주장]
-{digest_results(initial, 2100)}
+{digest_results(initial, 1700)}
 
 각 핵심 주장을 검증하라. 자료가 검증 실패 상태면 그것을 사실로 승인하지 마라.
 """
-        try:
-            verifier = run_role(
-                role="Verifier",
-                requested_engine=role_engine["Verifier"],
-                engines=engines,
-                state=state,
-                system=VERIFIER_SYSTEM,
-                prompt=verifier_prompt,
-                max_tokens=verifier_tokens,
-                continuations=continuations,
-            )
-        except Exception as exc:
-            verifier = error_result(exc)
-
-        rounds: List[Dict[str, Any]] = []
-        current = initial
-        for round_no in range(1, cross_rounds + 1):
-            next_round: Dict[str, Dict[str, Any]] = {}
-            digest = digest_results(current, 1700)
-            for role, role_rule in ROLE_RULES.items():
-                system = CROSS_EXAM_SYSTEM_TEMPLATE.format(
-                    role=role,
-                    role_rule=role_rule,
-                    constitution=REASONING_CONSTITUTION,
+            progress.write("2/5 · Evidence Verifier 호출")
+            stage_started = time.monotonic()
+            try:
+                verifier = run_role(
+                    role="Verifier",
+                    requested_engine=role_engine["Verifier"],
+                    engines=engines,
+                    state=state,
+                    system=VERIFIER_SYSTEM,
+                    prompt=verifier_prompt,
+                    max_tokens=verifier_tokens,
+                    continuations=continuations,
                 )
-                prompt = f"""
+                progress.write(
+                    f"✓ Verifier 완료 · {verifier.get('actual_engine')} · {time.monotonic() - stage_started:.1f}초"
+                )
+            except Exception as exc:
+                verifier = error_result(exc)
+                progress.write(f"✗ Verifier 실패 · {exc}")
+
+            rounds: List[Dict[str, Any]] = []
+            current = initial
+            for round_no in range(1, cross_rounds + 1):
+                digest = digest_results(current, 1500)
+                next_round = run_parallel_stage(
+                    roles=ROLE_RULES.keys(),
+                    role_engine=role_engine,
+                    engines=engines,
+                    state=state,
+                    system_for=lambda role: CROSS_EXAM_SYSTEM_TEMPLATE.format(
+                        role=role,
+                        role_rule=ROLE_RULES[role],
+                        constitution=REASONING_CONSTITUTION,
+                    ),
+                    prompt_for=lambda role, d=digest, rn=round_no: f"""
 {user_packet}
 
 [{evidence_label}]
-{clip(research_text, 5000)}
+{clip(research_text, 4200)}
 
 [Evidence Verifier]
-{clip(get_text(verifier), 3000)}
+{clip(get_text(verifier), 2500)}
 
 [직전 라운드 핵심 발언]
-{digest}
+{d}
 
-반박 라운드 {round_no}를 수행하라.
-"""
-                try:
-                    next_round[role] = run_role(
-                        role=role,
-                        requested_engine=role_engine[role],
-                        engines=engines,
-                        state=state,
-                        system=system,
-                        prompt=prompt,
-                        max_tokens=general_tokens,
-                        continuations=continuations,
-                    )
-                except Exception as exc:
-                    next_round[role] = error_result(exc)
-            rounds.append({"round": round_no, "responses": next_round})
-            current = next_round
+반박 라운드 {rn}를 수행하라.
+""",
+                    max_tokens=general_tokens,
+                    continuations=continuations,
+                    progress=progress,
+                    label=f"3/5 · 반박 라운드 {round_no}",
+                )
+                rounds.append({"round": round_no, "responses": next_round})
+                current = next_round
 
-        all_debate_parts = ["[독립 분석]\n" + digest_results(initial, 1800)]
-        for item in rounds:
-            all_debate_parts.append(
-                f"[반박 라운드 {item['round']}]\n" + digest_results(item["responses"], 1700)
-            )
-        all_debate_digest = "\n\n".join(all_debate_parts)
+            all_debate_parts = ["[독립 분석]\n" + digest_results(initial, 1600)]
+            for item in rounds:
+                all_debate_parts.append(
+                    f"[반박 라운드 {item['round']}]\n" + digest_results(item["responses"], 1500)
+                )
+            all_debate_digest = "\n\n".join(all_debate_parts)
 
-        auditor_prompt = f"""
+            auditor_prompt = f"""
 {user_packet}
 
 [Evidence Verifier]
-{clip(get_text(verifier), 3200)}
+{clip(get_text(verifier), 2700)}
 
 [전체 토론 압축]
-{clip(all_debate_digest, 16000)}
+{clip(all_debate_digest, 14000)}
 
 조건 위반, 자기모순, 회피성 문장을 감사하라.
 """
-        try:
-            auditor = run_role(
-                role="Auditor",
-                requested_engine=role_engine["Auditor"],
-                engines=engines,
-                state=state,
-                system=AUDITOR_SYSTEM,
-                prompt=auditor_prompt,
-                max_tokens=auditor_tokens,
-                continuations=continuations,
-            )
-        except Exception as exc:
-            auditor = error_result(exc)
+            progress.write("4/5 · Consistency Auditor 호출")
+            stage_started = time.monotonic()
+            try:
+                auditor = run_role(
+                    role="Auditor",
+                    requested_engine=role_engine["Auditor"],
+                    engines=engines,
+                    state=state,
+                    system=AUDITOR_SYSTEM,
+                    prompt=auditor_prompt,
+                    max_tokens=auditor_tokens,
+                    continuations=continuations,
+                )
+                progress.write(
+                    f"✓ Auditor 완료 · {auditor.get('actual_engine')} · {time.monotonic() - stage_started:.1f}초"
+                )
+            except Exception as exc:
+                auditor = error_result(exc)
+                progress.write(f"✗ Auditor 실패 · {exc}")
 
-        judge_prompt = f"""
+            judge_prompt = f"""
 {user_packet}
 
 [공용 조사 상태]
 {evidence_label}: {', '.join(research_validation.get('reasons') or ['검증 통과'])}
 
 [Evidence Verifier]
-{clip(get_text(verifier), 3500)}
+{clip(get_text(verifier), 3000)}
 
 [전체 토론 압축]
-{clip(all_debate_digest, 19000)}
+{clip(all_debate_digest, 16500)}
 
 [Consistency Auditor]
-{clip(get_text(auditor), 4200)}
+{clip(get_text(auditor), 3400)}
 
 위 자료를 종합해 간결한 최종 판결을 작성하라.
 """
-        try:
-            verdict_result = run_role(
-                role="Judge",
-                requested_engine=role_engine["Judge"],
-                engines=engines,
-                state=state,
-                system=JUDGE_SYSTEM,
-                prompt=judge_prompt,
-                max_tokens=judge_tokens,
-                continuations=continuations,
-            )
-        except Exception as exc:
-            verdict_result = error_result(exc, "Judge ERROR")
+            progress.write("5/5 · Judge 호출 · NVIDIA Ultra는 다른 단계보다 느릴 수 있음")
+            stage_started = time.monotonic()
+            try:
+                verdict_result = run_role(
+                    role="Judge",
+                    requested_engine=role_engine["Judge"],
+                    engines=engines,
+                    state=state,
+                    system=JUDGE_SYSTEM,
+                    prompt=judge_prompt,
+                    max_tokens=judge_tokens,
+                    continuations=continuations,
+                )
+                progress.write(
+                    f"✓ Judge 완료 · {verdict_result.get('actual_engine')} · {time.monotonic() - stage_started:.1f}초"
+                )
+            except Exception as exc:
+                verdict_result = error_result(exc, "Judge ERROR")
+                progress.write(f"✗ Judge 실패 · {exc}")
 
-        debate: Dict[str, Any] = {
-            "version": VERSION,
-            "created_at": datetime.now(timezone.utc).isoformat(),
-            "topic": topic,
-            "target": target,
-            "constraints": constraints,
-            "goal": goal,
-            "context": context,
-            "memory_used": [
-                {"id": row[0], "created_at": row[1], "topic": row[2], "verdict": row[3]}
-                for row in memories
-            ],
-            "research": {"text": research_text, "validation": research_validation},
-            "settings": {
-                "cross_rounds": cross_rounds,
-                "tokens": {
-                    "general": general_tokens,
-                    "verifier": verifier_tokens,
-                    "auditor": auditor_tokens,
-                    "judge": judge_tokens,
-                    "followup": followup_tokens,
+            debate: Dict[str, Any] = {
+                "version": VERSION,
+                "created_at": datetime.now(timezone.utc).isoformat(),
+                "topic": topic,
+                "target": target,
+                "constraints": constraints,
+                "goal": goal,
+                "context": context,
+                "memory_used": [
+                    {"id": row[0], "created_at": row[1], "topic": row[2], "verdict": row[3]}
+                    for row in memories
+                ],
+                "research": {"text": research_text, "validation": research_validation},
+                "settings": {
+                    "cross_rounds": cross_rounds,
+                    "tokens": {
+                        "general": general_tokens,
+                        "verifier": verifier_tokens,
+                        "auditor": auditor_tokens,
+                        "judge": judge_tokens,
+                        "followup": followup_tokens,
+                    },
+                    "role_engine": role_engine,
+                    "models": models,
+                    "budgets": {key: int(value) for key, value in budgets.items()},
                 },
-                "role_engine": role_engine,
-                "models": models,
-                "budgets": {key: int(value) for key, value in budgets.items()},
-            },
-            "initial": initial,
-            "verifier": verifier,
-            "rounds": rounds,
-            "auditor": auditor,
-            "verdict_result": verdict_result,
-            "verdict": get_text(verdict_result),
-            "diagnostics": state.diagnostics,
-            "followups": [],
-        }
+                "initial": initial,
+                "verifier": verifier,
+                "rounds": rounds,
+                "auditor": auditor,
+                "verdict_result": verdict_result,
+                "verdict": get_text(verdict_result),
+                "diagnostics": state.diagnostics,
+                "followups": [],
+            }
 
-        debate_id = MEMORY.save_debate(
-            version=VERSION,
-            topic=topic,
-            target=target,
-            constraints_text=constraints,
-            goal=goal,
-            context=context,
-            research=research_text,
-            verdict=debate["verdict"],
-            transcript=debate,
-        )
-        debate["debate_id"] = debate_id
-        st.session_state.current_debate = debate
-        st.success(f"Debate #{debate_id} 저장 완료")
+            st.session_state.current_debate = debate
+            try:
+                debate_id = MEMORY.save_debate(
+                    version=VERSION,
+                    topic=topic,
+                    target=target,
+                    constraints_text=constraints,
+                    goal=goal,
+                    context=context,
+                    research=research_text,
+                    verdict=debate["verdict"],
+                    transcript=debate,
+                )
+                debate["debate_id"] = debate_id
+                st.session_state.current_debate = debate
+                progress.write(f"✓ Debate #{debate_id} 로컬 저장 완료")
+            except Exception as exc:
+                progress.write(f"△ SQLite 저장 실패 · 결과는 화면에 계속 표시함 · {exc}")
+
+            progress.update(
+                label=f"토론 완료 · 총 {time.monotonic() - overall_started:.1f}초",
+                state="complete",
+            )
 
 if st.session_state.current_debate:
     render_debate(st.session_state.current_debate)
@@ -657,53 +727,57 @@ if st.session_state.current_debate:
 {current.get('constraints', '')}
 
 [대상 역할의 마지막 답변]
-{clip(get_text(target_result), 7000)}
+{clip(get_text(target_result), 6500)}
 
 [최종 판결]
-{clip(current.get('verdict', ''), 5000)}
+{clip(current.get('verdict', ''), 4500)}
 
 [Consistency Audit]
-{clip(get_text(current.get('auditor') or {}), 2800)}
+{clip(get_text(current.get('auditor') or {}), 2500)}
 
 [사용자 질문]
 {question}
 """
-            try:
-                result = call_with_fallback(
-                    requested,
-                    FALLBACKS.get(follow_target, FALLBACKS["Judge"]),
-                    engines,
-                    system,
-                    prompt,
-                    followup_tokens,
-                    continuations,
-                    follow_state,
-                )
-                item = {
-                    "created_at": datetime.now(timezone.utc).isoformat(),
-                    "target_role": follow_target,
-                    "question_type": question_type,
-                    "question": question,
-                    "answer": result.text,
-                    "engine": result.actual_engine,
-                    "model": result.model,
-                    "diagnostic": result.to_dict(),
-                }
-                current.setdefault("followups", []).append(item)
-                st.session_state.current_debate = current
-                if current.get("debate_id"):
-                    MEMORY.add_followup(
-                        debate_id=int(current["debate_id"]),
-                        target_role=follow_target,
-                        question_type=question_type,
-                        question=question,
-                        answer=result.text,
-                        engine=result.actual_engine,
-                        model=result.model,
+            with st.spinner(f"{follow_target} 답변 생성 중..."):
+                try:
+                    result = call_with_fallback(
+                        requested,
+                        FALLBACKS.get(follow_target, FALLBACKS["Judge"]),
+                        engines,
+                        system,
+                        prompt,
+                        followup_tokens,
+                        continuations,
+                        follow_state,
                     )
-                st.rerun()
-            except Exception as exc:
-                st.error(f"후속 질문 실패: {exc}")
+                    item = {
+                        "created_at": datetime.now(timezone.utc).isoformat(),
+                        "target_role": follow_target,
+                        "question_type": question_type,
+                        "question": question,
+                        "answer": result.text,
+                        "engine": result.actual_engine,
+                        "model": result.model,
+                        "diagnostic": result.to_dict(),
+                    }
+                    current.setdefault("followups", []).append(item)
+                    st.session_state.current_debate = current
+                    if current.get("debate_id"):
+                        try:
+                            MEMORY.add_followup(
+                                debate_id=int(current["debate_id"]),
+                                target_role=follow_target,
+                                question_type=question_type,
+                                question=question,
+                                answer=result.text,
+                                engine=result.actual_engine,
+                                model=result.model,
+                            )
+                        except Exception as exc:
+                            st.warning(f"답변은 받았지만 후속 질문 저장 실패: {exc}")
+                    st.rerun()
+                except Exception as exc:
+                    st.error(f"후속 질문 실패: {exc}")
 
     followups = current.get("followups") or []
     if followups:
