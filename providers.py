@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import re
+import threading
 import time
 from dataclasses import asdict, dataclass, field
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import requests
 
-VERSION = "프로토-1.1234571"
+VERSION = "프로토-1.1234571-fix1"
 
 
 @dataclass(frozen=True)
@@ -21,6 +22,7 @@ class EngineConfig:
     base_url: str = ""
     input_char_limit: int = 24000
     temperature: float = 0.35
+    timeout: int = 75
 
 
 @dataclass
@@ -50,30 +52,35 @@ class ProviderState:
     calls: Dict[str, int] = field(default_factory=dict)
     disabled_groups: Dict[str, str] = field(default_factory=dict)
     diagnostics: List[Dict[str, Any]] = field(default_factory=list)
+    lock: Any = field(default_factory=threading.Lock, repr=False)
 
     def can_call(self, engine: EngineConfig) -> Tuple[bool, str]:
-        if engine.group in self.disabled_groups:
-            return False, f"{engine.group} 차단됨: {self.disabled_groups[engine.group]}"
-        if not engine.api_key:
-            return False, f"{engine.label} API 키 없음"
-        used = self.calls.get(engine.group, 0)
-        limit = self.budgets.get(engine.group, 0)
-        if limit > 0 and used >= limit:
-            return False, f"{engine.group} 호출 예산 소진({used}/{limit})"
-        return True, ""
+        with self.lock:
+            if engine.group in self.disabled_groups:
+                return False, f"{engine.group} 차단됨: {self.disabled_groups[engine.group]}"
+            if not engine.api_key:
+                return False, f"{engine.label} API 키 없음"
+            used = self.calls.get(engine.group, 0)
+            limit = self.budgets.get(engine.group, 0)
+            if limit > 0 and used >= limit:
+                return False, f"{engine.group} 호출 예산 소진({used}/{limit})"
+            return True, ""
 
     def consume(self, engine: EngineConfig) -> None:
-        used = self.calls.get(engine.group, 0)
-        limit = self.budgets.get(engine.group, 0)
-        if limit > 0 and used >= limit:
-            raise RuntimeError(f"{engine.group} 호출 예산 소진({used}/{limit})")
-        self.calls[engine.group] = used + 1
+        with self.lock:
+            used = self.calls.get(engine.group, 0)
+            limit = self.budgets.get(engine.group, 0)
+            if limit > 0 and used >= limit:
+                raise RuntimeError(f"{engine.group} 호출 예산 소진({used}/{limit})")
+            self.calls[engine.group] = used + 1
 
     def block(self, engine: EngineConfig, reason: str) -> None:
-        self.disabled_groups[engine.group] = reason
+        with self.lock:
+            self.disabled_groups[engine.group] = reason
 
     def record(self, result: CallResult) -> None:
-        self.diagnostics.append(result.to_dict())
+        with self.lock:
+            self.diagnostics.append(result.to_dict())
 
 
 class ProviderFailure(RuntimeError):
@@ -114,11 +121,19 @@ def _usage(payload: Dict[str, Any]) -> Tuple[Optional[int], Optional[int], Optio
     return inp, out, total
 
 
-def _post(url: str, headers: Dict[str, str], body: Dict[str, Any], timeout: int = 180) -> Dict[str, Any]:
+def _post(
+    url: str,
+    headers: Dict[str, str],
+    body: Dict[str, Any],
+    *,
+    timeout: int = 75,
+) -> Dict[str, Any]:
     try:
         response = requests.post(url, headers=headers, json=body, timeout=timeout)
+    except requests.Timeout as exc:
+        raise ProviderFailure(f"응답 시간 초과({timeout}초)", category="retryable") from exc
     except requests.RequestException as exc:
-        # URL에 Gemini key가 포함될 수 있으므로 원문 exception/URL을 그대로 출력하지 않는다.
+        # Gemini는 URL에 key가 들어가므로 예외 원문의 URL을 그대로 노출하지 않는다.
         raise ProviderFailure(f"네트워크 요청 실패: {type(exc).__name__}", category="retryable") from exc
 
     if not response.ok:
@@ -132,6 +147,27 @@ def _post(url: str, headers: Dict[str, str], body: Dict[str, Any], timeout: int 
         return response.json()
     except Exception as exc:
         raise ProviderFailure("JSON 응답 해석 실패", category="other") from exc
+
+
+def _message_text(message: Dict[str, Any]) -> str:
+    content = message.get("content")
+    if isinstance(content, str) and content.strip():
+        return content.strip()
+    if isinstance(content, list):
+        parts: List[str] = []
+        for item in content:
+            if isinstance(item, dict):
+                value = item.get("text") or item.get("content")
+                if value:
+                    parts.append(str(value))
+            elif item:
+                parts.append(str(item))
+        if parts:
+            return "\n".join(parts).strip()
+    reasoning = message.get("reasoning_content") or message.get("reasoning")
+    if isinstance(reasoning, str) and reasoning.strip():
+        return reasoning.strip()
+    return ""
 
 
 def _call_openai_compatible(engine: EngineConfig, system: str, prompt: str, max_tokens: int) -> CallResult:
@@ -152,13 +188,18 @@ def _call_openai_compatible(engine: EngineConfig, system: str, prompt: str, max_
     if engine.group == "Groq" and "gpt-oss" in engine.model.lower():
         body["reasoning_effort"] = "low"
 
-    payload = _post(f"{engine.base_url}/chat/completions", headers, body)
+    payload = _post(
+        f"{engine.base_url}/chat/completions",
+        headers,
+        body,
+        timeout=engine.timeout,
+    )
     choices = payload.get("choices") or []
     if not choices:
         raise ProviderFailure("빈 choices 응답", category="empty")
     choice = choices[0]
     message = choice.get("message") or {}
-    text = (message.get("content") or "").strip()
+    text = _message_text(message)
     if not text:
         raise ProviderFailure("모델이 빈 응답을 반환함", category="empty")
     inp, out, total = _usage(payload)
@@ -185,7 +226,7 @@ def _call_gemini(engine: EngineConfig, system: str, prompt: str, max_tokens: int
         "contents": [{"role": "user", "parts": [{"text": prompt}]}],
         "generationConfig": {"maxOutputTokens": max_tokens, "temperature": engine.temperature},
     }
-    payload = _post(url, {"Content-Type": "application/json"}, body)
+    payload = _post(url, {"Content-Type": "application/json"}, body, timeout=engine.timeout)
     candidates = payload.get("candidates") or []
     if not candidates:
         raise ProviderFailure("Gemini 후보 응답 없음", category="empty")
@@ -280,18 +321,44 @@ def call_with_fallback(
             if exc.category in ("auth", "quota"):
                 state.block(engine, str(exc))
             if exc.category == "retryable":
-                time.sleep(1.0)
+                time.sleep(0.15)
             continue
         except Exception as exc:
             last_error = exc
             history.append(f"{engine.label}: {type(exc).__name__}")
             continue
 
-    raise RuntimeError("모든 엔진 호출 실패: " + " | ".join(history or [type(last_error).__name__ if last_error else "원인 없음"]))
+    raise RuntimeError(
+        "모든 엔진 호출 실패: "
+        + " | ".join(history or [type(last_error).__name__ if last_error else "원인 없음"])
+    )
 
 
-def validate_research(text: str) -> Dict[str, Any]:
+def _collect_urls(value: Any) -> List[str]:
+    found: List[str] = []
+
+    def walk(node: Any) -> None:
+        if isinstance(node, dict):
+            for key, item in node.items():
+                if key.lower() in {"url", "link", "source_url"} and isinstance(item, str):
+                    if item.startswith("http://") or item.startswith("https://"):
+                        found.append(item)
+                walk(item)
+        elif isinstance(node, list):
+            for item in node:
+                walk(item)
+        elif isinstance(node, str):
+            found.extend(re.findall(r"https?://[^\s)\]>\"']+", node))
+
+    walk(value)
+    return list(dict.fromkeys(found))
+
+
+def validate_research(text: str, extra_urls: Optional[Iterable[str]] = None) -> Dict[str, Any]:
     urls = re.findall(r"https?://[^\s)\]>]+", text or "")
+    if extra_urls:
+        urls.extend(extra_urls)
+    urls = list(dict.fromkeys(urls))
     refusal_markers = (
         "실시간 검색을 할 수 없",
         "웹 검색을 할 수 없",
@@ -301,34 +368,65 @@ def validate_research(text: str) -> Dict[str, Any]:
         "no browsing access",
     )
     reasons: List[str] = []
-    if len(set(urls)) < 2:
-        reasons.append("실제 URL 2개 미만")
     lower = (text or "").lower()
+    if not urls:
+        reasons.append("검색 출처 URL을 확인하지 못함")
     if any(marker.lower() in lower for marker in refusal_markers):
         reasons.append("웹검색 거부 문구 감지")
-    return {"usable": not reasons, "urls": list(dict.fromkeys(urls)), "reasons": reasons}
+    return {"usable": bool(text.strip()) and bool(urls) and not reasons, "urls": urls, "reasons": reasons}
 
 
-def research_with_groq(api_key: str, query: str, model: str = "groq/compound-mini") -> Tuple[str, Dict[str, Any]]:
+def research_with_groq(
+    api_key: str,
+    query: str,
+    model: str = "groq/compound-mini",
+) -> Tuple[str, Dict[str, Any]]:
     if not api_key:
         raise RuntimeError("Groq API 키가 없어 웹조사를 실행할 수 없음")
-    engine = EngineConfig(
-        engine_id="groq_research",
-        label="Groq Compound Mini",
-        group="Groq",
-        kind="openai",
-        model=model,
-        api_key=api_key,
-        base_url="https://api.groq.com/openai/v1",
-        input_char_limit=16000,
-        temperature=0.2,
+
+    body: Dict[str, Any] = {
+        "model": model,
+        "messages": [
+            {
+                "role": "system",
+                "content": (
+                    "공용 Evidence Researcher다. 실제 웹검색을 사용해 핵심 사실을 짧게 조사하라. "
+                    "가능하면 서로 다른 출처를 사용하고, 추측을 사실처럼 쓰지 마라."
+                ),
+            },
+            {"role": "user", "content": compact_text(query, 12000)},
+        ],
+        "max_tokens": 1200,
+        "temperature": 0.15,
+        "stream": False,
+        "citation_options": "enabled",
+    }
+    payload = _post(
+        "https://api.groq.com/openai/v1/chat/completions",
+        {
+            "Authorization": f"Bearer {api_key.strip()}",
+            "Content-Type": "application/json",
+        },
+        body,
+        timeout=60,
     )
-    system = (
-        "공용 Evidence Researcher다. 반드시 실제 웹검색 결과를 사용하고 핵심 주장마다 출처 URL을 붙여라. "
-        "최소 2개의 실제 URL을 포함하라. 검색하지 못했다면 추측으로 메우지 말고 실패를 명시하라."
-    )
-    result = _call_engine(engine, system, compact_text(query, 14000), 1800)
-    return result.text, validate_research(result.text)
+    choices = payload.get("choices") or []
+    if not choices:
+        raise ProviderFailure("Groq 웹조사 응답에 choices가 없음", category="empty")
+    message = (choices[0] or {}).get("message") or {}
+    text = _message_text(message)
+    if not text:
+        raise ProviderFailure("Groq 웹조사가 빈 응답을 반환함", category="empty")
+
+    urls = _collect_urls(message.get("executed_tools") or [])
+    urls.extend(_collect_urls(payload.get("citations") or []))
+    urls = list(dict.fromkeys(urls))
+    if urls:
+        missing = [url for url in urls if url not in text]
+        if missing:
+            text = text.rstrip() + "\n\n[검색 출처]\n" + "\n".join(f"- {url}" for url in missing[:10])
+
+    return text, validate_research(text, urls)
 
 
 def build_engines(keys: Dict[str, str], models: Dict[str, str]) -> Dict[str, EngineConfig]:
@@ -341,6 +439,7 @@ def build_engines(keys: Dict[str, str], models: Dict[str, str]) -> Dict[str, Eng
             model=models["gemini"],
             api_key=keys.get("Gemini", ""),
             input_char_limit=24000,
+            timeout=60,
         ),
         "groq": EngineConfig(
             engine_id="groq",
@@ -351,6 +450,7 @@ def build_engines(keys: Dict[str, str], models: Dict[str, str]) -> Dict[str, Eng
             api_key=keys.get("Groq", ""),
             base_url="https://api.groq.com/openai/v1",
             input_char_limit=17000,
+            timeout=60,
         ),
         "cerebras": EngineConfig(
             engine_id="cerebras",
@@ -361,6 +461,7 @@ def build_engines(keys: Dict[str, str], models: Dict[str, str]) -> Dict[str, Eng
             api_key=keys.get("Cerebras", ""),
             base_url="https://api.cerebras.ai/v1",
             input_char_limit=24000,
+            timeout=60,
         ),
         "nvidia_super": EngineConfig(
             engine_id="nvidia_super",
@@ -371,6 +472,7 @@ def build_engines(keys: Dict[str, str], models: Dict[str, str]) -> Dict[str, Eng
             api_key=keys.get("NVIDIA", ""),
             base_url="https://integrate.api.nvidia.com/v1",
             input_char_limit=28000,
+            timeout=75,
         ),
         "nvidia_ultra": EngineConfig(
             engine_id="nvidia_ultra",
@@ -381,5 +483,6 @@ def build_engines(keys: Dict[str, str], models: Dict[str, str]) -> Dict[str, Eng
             api_key=keys.get("NVIDIA", ""),
             base_url="https://integrate.api.nvidia.com/v1",
             input_char_limit=28000,
+            timeout=90,
         ),
     }
